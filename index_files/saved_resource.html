@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Future Founders Program – RTIH Rajahmundry</title>
+<meta name="description" content="A 45-day hybrid accelerator by Ratan Tata Innovation Hub taking early-stage entrepreneurs from Ideation to Prototype. Starts May 18, 2026.">
+<meta property="og:title" content="Future Founders Program – RTIH Rajahmundry">
+<meta property="og:description" content="45-day hybrid accelerator: Ideation → Prototype. May 18 – Jul 9, 2026. Applications open.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com/">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&amp;family=IBM+Plex+Mono:wght@400;700&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --orange: #FF6B35;
+    --teal: #2EC4B6;
+    --purple: #8338EC;
+    --pink: #F72585;
+    --yellow: #FFD60A;
+    --green: #06FFA5;
+    --bg: #0a0a0f;
+    --surface: #0d0d14;
+    --text: #e8e4d9;
+    --muted: #888;
+    --border: rgba(255,255,255,0.07);
+  }
+  html { scroll-behavior: smooth; }
+  body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  .serif { font-family: 'Playfair Display', serif; }
+
+  /* HEADER */
+  .header {
+    background: linear-gradient(135deg, #0a0a0f 0%, #1a0a2e 50%, #0a0a0f 100%);
+    border-bottom: 1px solid rgba(255,107,53,0.3);
+    padding: 52px 32px 36px;
+    position: relative; overflow: hidden;
+  }
+  .header::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: radial-gradient(circle at 20% 50%, rgba(255,107,53,0.08) 0%, transparent 50%),
+                radial-gradient(circle at 80% 20%, rgba(131,56,236,0.1) 0%, transparent 40%);
+  }
+  .header-inner { position: relative; max-width: 900px; margin: 0 auto; }
+  .badges { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px; letter-spacing: 3px; font-weight: 700;
+    padding: 3px 12px;
+  }
+  .badge-orange { background: var(--orange); color: #fff; }
+  .badge-dark { background: rgba(255,255,255,0.05); color: #aaa; }
+  h1 { font-family: 'Playfair Display', serif; font-size: clamp(36px, 7vw, 64px); font-weight: 900; line-height: 1; letter-spacing: -2px; margin: 16px 0 8px; }
+  h1 span { color: var(--orange); }
+  .tagline { color: #aaa; font-style: italic; font-size: 16px; margin-top: 10px; letter-spacing: 0.5px; }
+  .header-stats { display: flex; gap: 28px; flex-wrap: wrap; margin-top: 28px; }
+  .stat-label { font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 3px; color: #555; }
+  .stat-value { font-size: 15px; font-weight: 700; margin-top: 3px; }
+
+  /* NAV */
+  nav {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 100; overflow-x: auto;
+  }
+  .nav-inner { max-width: 900px; margin: 0 auto; display: flex; }
+  .nav-btn {
+    background: none; border: none; cursor: pointer;
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 2px;
+    color: #555; padding: 14px 20px; white-space: nowrap;
+    border-bottom: 2px solid transparent; transition: all 0.2s;
+  }
+  .nav-btn:hover { color: #aaa; }
+  .nav-btn.active { color: var(--orange); border-bottom-color: var(--orange); font-weight: 700; }
+
+  /* MAIN */
+  .main { max-width: 900px; margin: 0 auto; padding: 36px 24px 60px; }
+
+  /* OVERVIEW */
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; margin-bottom: 40px; }
+  .stat-card {
+    border-radius: 8px; padding: 18px 14px; text-align: center;
+    border: 1px solid; transition: transform 0.2s;
+  }
+  .stat-card:hover { transform: translateY(-2px); }
+  .stat-card-n { font-family: 'IBM Plex Mono', monospace; font-size: 26px; font-weight: 700; }
+  .stat-card-l { font-size: 10px; letter-spacing: 1px; color: #777; margin-top: 4px; }
+
+  .section-label { font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 4px; color: #555; margin-bottom: 14px; }
+  .objective { line-height: 1.85; color: #c8c4b9; font-size: 15px; margin-bottom: 36px; }
+  .objective strong { color: var(--orange); }
+
+  .phase-row {
+    border-radius: 0 8px 8px 0; padding: 16px 20px;
+    display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px;
+    margin-bottom: 10px; border: 1px solid; border-left-width: 4px;
+  }
+  .phase-tag {
+    font-family: 'IBM Plex Mono', monospace; font-size: 9px;
+    padding: 2px 8px; font-weight: 700; letter-spacing: 1px; margin-right: 10px; color: #000;
+  }
+  .phase-name { font-weight: 700; font-size: 16px; }
+  .phase-theme { font-size: 13px; color: #aaa; margin-top: 4px; }
+  .phase-dates { font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
+  .phase-weeks { font-size: 11px; color: #555; margin-top: 2px; text-align: right; }
+
+  .mode-box {
+    border-radius: 8px; padding: 20px 24px;
+    border: 1px solid; margin-top: 32px;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
+  }
+  .mode-title { font-weight: 700; font-size: 13px; margin-bottom: 8px; }
+  .mode-body { font-size: 13px; color: #aaa; line-height: 1.8; }
+
+  /* AGENDA */
+  .agenda-note { color: #777; font-size: 13px; margin-bottom: 28px; font-style: italic; }
+  .phase-accordion { margin-bottom: 14px; }
+  .phase-toggle {
+    width: 100%; background: none; cursor: pointer; padding: 16px 20px;
+    display: flex; justify-content: space-between; align-items: center;
+    text-align: left; color: var(--text); border-radius: 8px; border: 1px solid;
+    transition: border-radius 0.15s;
+  }
+  .phase-toggle.open { border-radius: 8px 8px 0 0; }
+  .toggle-title { font-weight: 700; font-size: 15px; }
+  .toggle-sub { font-size: 12px; color: #666; margin-top: 4px; }
+  .toggle-icon { font-family: 'IBM Plex Mono', monospace; font-size: 22px; }
+  .phase-body { border: 1px solid; border-top: none; border-radius: 0 0 8px 8px; overflow: hidden; }
+  .day-row {
+    display: grid; grid-template-columns: 70px 110px 1fr;
+    padding: 14px 20px; gap: 14px; align-items: start;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .day-row:last-child { border-bottom: none; }
+  .day-row.alt { background: rgba(255,255,255,0.015); }
+  .day-num-label { font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 1px; color: #555; }
+  .day-num { font-family: 'IBM Plex Mono', monospace; font-size: 20px; font-weight: 900; }
+  .mode-pill {
+    font-family: 'IBM Plex Mono', monospace; font-size: 9px; font-weight: 700;
+    padding: 2px 7px; border-radius: 3px; display: inline-block; margin-bottom: 5px; letter-spacing: 1px;
+  }
+  .mode-physical { background: rgba(255,107,53,0.2); color: var(--orange); }
+  .mode-virtual { background: rgba(46,196,182,0.15); color: var(--teal); }
+  .day-date { font-size: 11px; color: #555; }
+  .day-topic { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+  .day-desc { font-size: 12px; color: #777; line-height: 1.6; }
+
+  /* REQUIREMENTS */
+  .req-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px; }
+  .req-card { border-radius: 8px; overflow: hidden; border: 1px solid; }
+  .req-header { padding: 12px 18px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid; }
+  .req-icon { font-size: 20px; }
+  .req-title { font-weight: 700; font-size: 14px; }
+  .req-body { padding: 14px 18px; }
+  .req-item { display: flex; gap: 10px; margin-bottom: 9px; align-items: flex-start; }
+  .req-bullet { font-size: 9px; margin-top: 4px; flex-shrink: 0; }
+  .req-text { font-size: 13px; color: #b8b5ad; line-height: 1.55; }
+
+  /* TIMELINE */
+  .timeline-wrap { position: relative; padding-left: 32px; }
+  .timeline-line {
+    position: absolute; left: 14px; top: 0; bottom: 0; width: 2px;
+    background: linear-gradient(to bottom, var(--orange), var(--purple), var(--teal), var(--pink));
+  }
+  .tl-item { margin-bottom: 26px; position: relative; }
+  .tl-dot {
+    position: absolute; left: calc(-32px + 14px - 8px); top: 5px;
+    width: 16px; height: 16px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 8px; font-weight: 700;
+  }
+  .tl-card { border-radius: 8px; padding: 14px 20px; border: 1px solid; }
+  .tl-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .tl-name { font-weight: 700; font-size: 15px; }
+  .tl-date { font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 3px 10px; border-radius: 4px; }
+  .tl-done-label { font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 2px; margin-top: 6px; color: var(--orange); }
+  .holiday-note { border-radius: 8px; padding: 20px 24px; border: 1px solid rgba(46,196,182,0.2); background: rgba(46,196,182,0.04); margin-top: 24px; }
+  .holiday-label { font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 3px; color: var(--teal); margin-bottom: 10px; }
+  .holiday-text { font-size: 13px; color: #777; line-height: 1.8; }
+
+  /* FOOTER */
+  footer {
+    text-align: center; padding: 28px 24px;
+    border-top: 1px solid var(--border); margin-top: 0;
+  }
+  .footer-main { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #3a3a4a; letter-spacing: 2px; }
+  .footer-sub { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #2a2a38; margin-top: 5px; letter-spacing: 1px; }
+
+  /* PANELS */
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  @media (max-width: 600px) {
+    .header { padding: 36px 18px 28px; }
+    .main { padding: 24px 16px 48px; }
+    .day-row { grid-template-columns: 55px 90px 1fr; gap: 10px; }
+    .mode-box { grid-template-columns: 1fr; }
+    .req-grid { grid-template-columns: 1fr; }
+    h1 { font-size: 38px; }
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<header class="header">
+  <div class="header-inner">
+    <div class="badges">
+      <span class="badge badge-orange">RTIH</span>
+      <span class="badge badge-dark">RAJAHMUNDRY · EAST GODAVARI · A.P.</span>
+      <span class="badge badge-dark">2026 COHORT</span>
+    </div>
+    <h1 class="serif">Future<br><span>Founders</span><br>Program</h1>
+    <p class="tagline">Ideation → Prototype &nbsp;·&nbsp; 45 Working Days</p>
+    <div class="header-stats">
+      <div><div class="stat-label">START DATE</div><div class="stat-value">May 18, 2026</div></div>
+      <div><div class="stat-label">END DATE</div><div class="stat-value">Jul 9, 2026</div></div>
+      <div><div class="stat-label">DURATION</div><div class="stat-value">45 Working Days</div></div>
+      <div><div class="stat-label">TIMINGS</div><div class="stat-value">9 AM – 1 PM</div></div>
+    </div>
+  </div>
+</header>
+
+<nav>
+  <div class="nav-inner">
+    <button class="nav-btn active" onclick="showTab(&#39;overview&#39;, this)">Overview</button>
+    <button class="nav-btn" onclick="showTab(&#39;agenda&#39;, this)">Full Agenda</button>
+    <button class="nav-btn" onclick="showTab(&#39;requirements&#39;, this)">Requirements</button>
+    <button class="nav-btn" onclick="showTab(&#39;timeline&#39;, this)">Timeline</button>
+  </div>
+</nav>
+
+<main class="main">
+
+  <!-- OVERVIEW -->
+  <div id="tab-overview" class="panel active">
+    <div class="stat-grid">
+      <div class="stat-card" style="border-color:rgba(255,107,53,0.3);background:rgba(255,107,53,0.06)">
+        <div class="stat-card-n" style="color:#FF6B35">45</div><div class="stat-card-l">Working Days</div>
+      </div>
+      <div class="stat-card" style="border-color:rgba(46,196,182,0.3);background:rgba(46,196,182,0.06)">
+        <div class="stat-card-n" style="color:#2EC4B6">4</div><div class="stat-card-l">Phases</div>
+      </div>
+      <div class="stat-card" style="border-color:rgba(131,56,236,0.3);background:rgba(131,56,236,0.06)">
+        <div class="stat-card-n" style="color:#8338EC">3</div><div class="stat-card-l">Physical Days</div>
+      </div>
+      <div class="stat-card" style="border-color:rgba(247,37,133,0.3);background:rgba(247,37,133,0.06)">
+        <div class="stat-card-n" style="color:#F72585">9→1</div><div class="stat-card-l">Daily Session (AM)</div>
+      </div>
+      <div class="stat-card" style="border-color:rgba(255,214,10,0.3);background:rgba(255,214,10,0.06)">
+        <div class="stat-card-n" style="color:#FFD60A">40</div><div class="stat-card-l">Cohort Size</div>
+      </div>
+      <div class="stat-card" style="border-color:rgba(6,255,165,0.3);background:rgba(6,255,165,0.06)">
+        <div class="stat-card-n" style="color:#06FFA5">₹0</div><div class="stat-card-l">Program Fee</div>
+      </div>
+    </div>
+
+    <div class="section-label">PROGRAM OBJECTIVE</div>
+    <p class="objective">
+      The <strong>Future Founders Program</strong> by Ratan Tata Innovation Hub (RTIH), Rajahmundry, is a structured 45-day hybrid accelerator designed to take early-stage entrepreneurs from raw idea to validated prototype. Participants journey through four phases — <em>Ignite, Build, Test, and Launch</em> — gaining hands-on skills in design thinking, business modelling, financial literacy, prototyping, and investor pitching. The program culminates in a public Demo Day where cohort teams present their ventures to industry, government, and investment stakeholders.
+    </p>
+
+    <div class="section-label">PHASE OVERVIEW</div>
+
+    <div class="phase-row" style="border-color:rgba(255,107,53,0.25);border-left-color:#FF6B35;background:rgba(255,107,53,0.04)">
+      <div>
+        <span class="phase-tag" style="background:#FF6B35">Phase 1</span>
+        <span class="phase-name">IGNITE</span>
+        <div class="phase-theme">Ideation &amp; Problem Discovery</div>
+      </div>
+      <div>
+        <div class="phase-dates" style="color:#FF6B35">May 18 – May 30, 2026</div>
+        <div class="phase-weeks">Week 1–2 · Days 1–12</div>
+      </div>
+    </div>
+
+    <div class="phase-row" style="border-color:rgba(46,196,182,0.25);border-left-color:#2EC4B6;background:rgba(46,196,182,0.04)">
+      <div>
+        <span class="phase-tag" style="background:#2EC4B6">Phase 2</span>
+        <span class="phase-name">BUILD</span>
+        <div class="phase-theme">Business Modelling &amp; MVP Design</div>
+      </div>
+      <div>
+        <div class="phase-dates" style="color:#2EC4B6">Jun 1 – Jun 13, 2026</div>
+        <div class="phase-weeks">Week 3–4 · Days 13–24</div>
+      </div>
+    </div>
+
+    <div class="phase-row" style="border-color:rgba(131,56,236,0.25);border-left-color:#8338EC;background:rgba(131,56,236,0.04)">
+      <div>
+        <span class="phase-tag" style="background:#8338EC">Phase 3</span>
+        <span class="phase-name">TEST</span>
+        <div class="phase-theme">Prototype Testing &amp; Go-to-Market</div>
+      </div>
+      <div>
+        <div class="phase-dates" style="color:#8338EC">Jun 15 – Jun 27, 2026</div>
+        <div class="phase-weeks">Week 5–6 · Days 25–36</div>
+      </div>
+    </div>
+
+    <div class="phase-row" style="border-color:rgba(247,37,133,0.25);border-left-color:#F72585;background:rgba(247,37,133,0.04)">
+      <div>
+        <span class="phase-tag" style="background:#F72585">Phase 4</span>
+        <span class="phase-name">LAUNCH</span>
+        <div class="phase-theme">Final Prototype, Pitch &amp; Demo Day</div>
+      </div>
+      <div>
+        <div class="phase-dates" style="color:#F72585">Jun 29 – Jul 9, 2026</div>
+        <div class="phase-weeks">Week 7–9 · Days 37–45</div>
+      </div>
+    </div>
+
+    <div class="mode-box" style="border-color:rgba(255,107,53,0.2);background:rgba(255,107,53,0.03);margin-top:32px">
+      <div>
+        <div class="mode-title" style="color:#FF6B35">🏢 Physical Days (3 Days)</div>
+        <div class="mode-body">
+          Day 1 — Orientation &amp; Kickoff (May 18)<br>
+          Day 3 — Design Thinking Workshop (May 20)<br>
+          Day 45 — Demo Day · Grand Finale (Jul 9)
+        </div>
+      </div>
+      <div>
+        <div class="mode-title" style="color:#2EC4B6">💻 Virtual Days (42 Days)</div>
+        <div class="mode-body">
+          All remaining days via Google Meet / Zoom<br>
+          Sessions recorded &amp; archived for 90 days<br>
+          LMS access for resources &amp; submissions
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AGENDA -->
+  <div id="tab-agenda" class="panel">
+    <p class="agenda-note">Session timings: 9:00 AM – 11:00 AM (Content) · Break 11:00–11:15 AM · Workshop 11:15 AM – 1:00 PM. Click a phase to expand.</p>
+
+    <!-- Phase 1 -->
+    <div class="phase-accordion">
+      <button class="phase-toggle" style="background:rgba(255,107,53,0.08);border-color:rgba(255,107,53,0.35)" onclick="togglePhase(&#39;p1&#39;, this)">
+        <div>
+          <span class="mono" style="color:#FF6B35;font-size:10px;letter-spacing:2px;margin-right:12px">PHASE 1</span>
+          <span class="toggle-title">IGNITE — Ideation &amp; Problem Discovery</span>
+          <div class="toggle-sub">May 18–30, 2026 · Days 1–12</div>
+        </div>
+        <span class="toggle-icon" style="color:#FF6B35" id="icon-p1">+</span>
+      </button>
+      <div class="phase-body" id="body-p1" style="display:none;border-color:rgba(255,107,53,0.2)">
+        <div class="day-row">
+          <div><div class="day-num-label">DAY</div><div class="day-num" style="color:#FF6B35">1–2</div></div>
+          <div><span class="mode-pill mode-physical">PHYSICAL</span><div class="day-date">May 18–19</div></div>
+          <div><div class="day-topic">Orientation &amp; Cohort Kickoff</div><div class="day-desc">Welcome ceremony, RTIH overview, cohort introductions, program rules, mentor intros, team formation ice-breakers</div></div>
+        </div>
+        <div class="day-row alt">
+          <div><div class="day-num-label">DAY</div><div class="day-num" style="color:#FF6B35">3</div></div>
+          <div><span class="mode-pill mode-physical">PHYSICAL</span><div class="day-date">May 20</div></div>
+          <div><div class="day-topic">Design Thinking Workshop</div><div class="day-desc">Empathy mapping, problem framing, 'How Might We' exercises, hands-on rapid ideation sprints</div></div>
+        </div>
+        <div class="day-row">
+          <div><div class="day-num-label">DAY</div><div class="day-num" style="color:#FF6B35">4–6</div></div>
+          <div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">May 21–23</div></div>
+          <div><div class="day-topic">Problem Validation</div><div class="day-desc">Primary research methods, customer interview frameworks, survey design, online field interviews with target users</div></div>
+        </div>
+        <div class="day-row alt">
+          <div><div class="day-num-label">DAY</div><div class="day-num" style="color:#FF6B35">7–9</div></div>
+          <div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">May 25–27</div></div>
+          <div><div class="day-topic">Market Analysis</div><div class="day-desc">TAM/SAM/SOM, competitor landscape, identifying white spaces, AP &amp; India-specific sector opportunities (Agri, Export, Handloom, Tourism)</div></div>
+        </div>
+        <div class="day-row">
+          <div><div class="day-num-label">DAY</div><div class="day-num" style="color:#FF6B35">10–12</div></div>
+          <div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">May 28–30</div></div>
+          <div><div class="day-topic">Idea Validation Sprint</div><div class="day-desc">Idea scoring matrix, mentor feedback sessions, pivot or persevere decision, Week 1–2 reflection journal submission</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Phase 2 -->
+    <div class="phase-accordion">
+      <button class="phase-toggle" style="background:rgba(46,196,182,0.08);border-color:rgba(46,196,182,0.35)" onclick="togglePhase(&#39;p2&#39;, this)">
+        <div>
+          <span class="mono" style="color:#2EC4B6;font-size:10px;letter-spacing:2px;margin-right:12px">PHASE 2</span>
+          <span class="toggle-title">BUILD — Business Modelling &amp; MVP Design</span>
+          <div class="toggle-sub">Jun 1–13, 2026 · Days 13–24</div>
+        </div>
+        <span class="toggle-icon" style="color:#2EC4B6" id="icon-p2">+</span>
+      </button>
+      <div class="phase-body" id="body-p2" style="display:none;border-color:rgba(46,196,182,0.2)">
+        <div class="day-row"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#2EC4B6">13–14</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 1–2</div></div><div><div class="day-topic">Business Model Canvas</div><div class="day-desc">9-block BMC deep dive, value proposition design, customer segments, revenue streams, cost structure for MSMEs</div></div></div>
+        <div class="day-row alt"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#2EC4B6">15–16</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 3–4</div></div><div><div class="day-topic">Financial Literacy for Startups</div><div class="day-desc">Unit economics, burn rate, break-even, PMEGP &amp; CGTMSE funding pathways, basic P&amp;L modelling</div></div></div>
+        <div class="day-row"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#2EC4B6">17–18</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 5–6</div></div><div><div class="day-topic">Legal &amp; Compliance Basics</div><div class="day-desc">Business registration (UDYAM, DPIIT), IP basics, GST, FSSAI, export compliance (IEC, APEDA/RCMC intro)</div></div></div>
+        <div class="day-row alt"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#2EC4B6">19–21</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 8–10</div></div><div><div class="day-topic">MVP Planning &amp; Wireframing</div><div class="day-desc">What is an MVP, scoping the smallest testable version, low-fi wireframing tools, user story mapping</div></div></div>
+        <div class="day-row"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#2EC4B6">22–24</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 11–13</div></div><div><div class="day-topic">Prototype Sprint I</div><div class="day-desc">Hands-on prototype building (physical/digital), daily stand-ups, peer feedback loops, mid-program check-in</div></div></div>
+      </div>
+    </div>
+
+    <!-- Phase 3 -->
+    <div class="phase-accordion">
+      <button class="phase-toggle" style="background:rgba(131,56,236,0.08);border-color:rgba(131,56,236,0.35)" onclick="togglePhase(&#39;p3&#39;, this)">
+        <div>
+          <span class="mono" style="color:#8338EC;font-size:10px;letter-spacing:2px;margin-right:12px">PHASE 3</span>
+          <span class="toggle-title">TEST — Prototype Testing &amp; Go-to-Market</span>
+          <div class="toggle-sub">Jun 15–27, 2026 · Days 25–36</div>
+        </div>
+        <span class="toggle-icon" style="color:#8338EC" id="icon-p3">+</span>
+      </button>
+      <div class="phase-body" id="body-p3" style="display:none;border-color:rgba(131,56,236,0.2)">
+        <div class="day-row"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#8338EC">25–26</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 15–16</div></div><div><div class="day-topic">User Testing Methods</div><div class="day-desc">Usability testing scripts, A/B testing basics, feedback collection frameworks, iteration cycles</div></div></div>
+        <div class="day-row alt"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#8338EC">27–29</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 18–20</div></div><div><div class="day-topic">Digital Marketing &amp; Branding</div><div class="day-desc">Brand identity, social media strategy, content marketing for startups, digital storytelling</div></div></div>
+        <div class="day-row"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#8338EC">30–32</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 22–24</div></div><div><div class="day-topic">Sales &amp; Go-to-Market Strategy</div><div class="day-desc">GTM canvas, distribution channels, B2B vs B2C sales approach, pilot customer acquisition</div></div></div>
+        <div class="day-row alt"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#8338EC">33–35</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 25–27</div></div><div><div class="day-topic">Pitching &amp; Storytelling</div><div class="day-desc">Pitch deck structure, storytelling frameworks (Hero's Journey), investor language, 3-minute pitch practice</div></div></div>
+        <div class="day-row"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#8338EC">36</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 29</div></div><div><div class="day-topic">Mock Pitch Round I</div><div class="day-desc">Internal pitch with mentor panel, structured feedback, refinement plan for final week</div></div></div>
+      </div>
+    </div>
+
+    <!-- Phase 4 -->
+    <div class="phase-accordion">
+      <button class="phase-toggle" style="background:rgba(247,37,133,0.08);border-color:rgba(247,37,133,0.35)" onclick="togglePhase(&#39;p4&#39;, this)">
+        <div>
+          <span class="mono" style="color:#F72585;font-size:10px;letter-spacing:2px;margin-right:12px">PHASE 4</span>
+          <span class="toggle-title">LAUNCH — Final Prototype, Pitch &amp; Demo Day</span>
+          <div class="toggle-sub">Jun 29 – Jul 9, 2026 · Days 37–45</div>
+        </div>
+        <span class="toggle-icon" style="color:#F72585" id="icon-p4">+</span>
+      </button>
+      <div class="phase-body" id="body-p4" style="display:none;border-color:rgba(247,37,133,0.2)">
+        <div class="day-row"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#F72585">37–39</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jun 30–Jul 2</div></div><div><div class="day-topic">Final Prototype Refinement</div><div class="day-desc">Incorporating all feedback, stress-testing the prototype, final business model validation</div></div></div>
+        <div class="day-row alt"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#F72585">40–41</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jul 3–4</div></div><div><div class="day-topic">DPR &amp; Documentation</div><div class="day-desc">Drafting one-page business plan, executive summary, PMEGP/SIDBI linkage documentation, export readiness checklist</div></div></div>
+        <div class="day-row"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#F72585">42–43</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jul 6–7</div></div><div><div class="day-topic">Demo Day Rehearsals</div><div class="day-desc">Full rehearsals with time-keeping, Q&amp;A drills, panel preparation, visual assets finalization</div></div></div>
+        <div class="day-row alt"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#F72585">44</div></div><div><span class="mode-pill mode-virtual">VIRTUAL</span><div class="day-date">Jul 8</div></div><div><div class="day-topic">Pre-Demo Prep &amp; Setup</div><div class="day-desc">Technical run-through, logistics, press/media brief, stakeholder invitations confirmed</div></div></div>
+        <div class="day-row"><div><div class="day-num-label">DAY</div><div class="day-num" style="color:#F72585">45</div></div><div><span class="mode-pill mode-physical">PHYSICAL</span><div class="day-date">Jul 9</div></div><div><div class="day-topic">🏆 DEMO DAY — Grand Finale</div><div class="day-desc">Public prototype showcase, pitch competition before jury (investors, RTIH, industry), awards, certificates, next-step linkages (incubation, funding, mentorship)</div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- REQUIREMENTS -->
+  <div id="tab-requirements" class="panel">
+    <div class="req-grid">
+
+      <div class="req-card" style="border-color:rgba(255,107,53,0.2)">
+        <div class="req-header" style="background:rgba(255,107,53,0.1);border-color:rgba(255,107,53,0.2)">
+          <span class="req-icon">🎯</span><span class="req-title" style="color:#FF6B35">Eligibility &amp; Selection</span>
+        </div>
+        <div class="req-body">
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Age: 18–35 years (students, early-stage entrepreneurs, graduates)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Minimum qualification: 10+2 / Diploma / UG (any stream)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Open to individuals &amp; teams of 2–3 members</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Priority sectors: Agri, Handloom, Tourism, Food Processing, Export, Tech</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Selection via: Written Application + Idea Submission + Screening Interview</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Cohort size: 30–40 participants</span></div>
+        </div>
+      </div>
+
+      <div class="req-card" style="border-color:rgba(46,196,182,0.2)">
+        <div class="req-header" style="background:rgba(46,196,182,0.1);border-color:rgba(46,196,182,0.2)">
+          <span class="req-icon">📋</span><span class="req-title" style="color:#2EC4B6">Registration Requirements</span>
+        </div>
+        <div class="req-body">
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Online application form with idea brief (500 words max)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Aadhaar / Government-issued ID proof</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Educational certificates</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Team details (if applicable)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">NOC from institution/employer (if applicable)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Application fee: NIL (RTIH subsidised program)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Registration deadline: May 10, 2026</span></div>
+        </div>
+      </div>
+
+      <div class="req-card" style="border-color:rgba(131,56,236,0.2)">
+        <div class="req-header" style="background:rgba(131,56,236,0.1);border-color:rgba(131,56,236,0.2)">
+          <span class="req-icon">🏢</span><span class="req-title" style="color:#8338EC">Infrastructure – Physical Days</span>
+        </div>
+        <div class="req-body">
+          <div class="req-item"><span class="req-bullet" style="color:#8338EC">▶</span><span class="req-text">Venue: RTIH Rajahmundry Hub (3 physical days: Day 1, Day 3, Day 45)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#8338EC">▶</span><span class="req-text">Seating capacity for 40 participants + 10 mentors</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#8338EC">▶</span><span class="req-text">Projector, whiteboard, markers, post-it notes, design kits</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#8338EC">▶</span><span class="req-text">High-speed internet (min. 100 Mbps)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#8338EC">▶</span><span class="req-text">Refreshments &amp; lunch provided on physical days</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#8338EC">▶</span><span class="req-text">Prototype display area for Demo Day (10×10 stalls)</span></div>
+        </div>
+      </div>
+
+      <div class="req-card" style="border-color:rgba(247,37,133,0.2)">
+        <div class="req-header" style="background:rgba(247,37,133,0.1);border-color:rgba(247,37,133,0.2)">
+          <span class="req-icon">💻</span><span class="req-title" style="color:#F72585">Infrastructure – Virtual Days</span>
+        </div>
+        <div class="req-body">
+          <div class="req-item"><span class="req-bullet" style="color:#F72585">▶</span><span class="req-text">Platform: Google Meet / Zoom (licensed account)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#F72585">▶</span><span class="req-text">LMS: Google Classroom or Notion workspace for resources</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#F72585">▶</span><span class="req-text">Each participant needs: laptop/smartphone, stable internet</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#F72585">▶</span><span class="req-text">Sessions recorded and archived for 90 days</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#F72585">▶</span><span class="req-text">Breakout rooms for team collaboration</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#F72585">▶</span><span class="req-text">WhatsApp group for daily updates and Q&amp;A</span></div>
+        </div>
+      </div>
+
+      <div class="req-card" style="border-color:rgba(255,214,10,0.2)">
+        <div class="req-header" style="background:rgba(255,214,10,0.08);border-color:rgba(255,214,10,0.2)">
+          <span class="req-icon">🧑‍🏫</span><span class="req-title" style="color:#FFD60A">Mentors &amp; Experts</span>
+        </div>
+        <div class="req-body">
+          <div class="req-item"><span class="req-bullet" style="color:#FFD60A">▶</span><span class="req-text">Lead Mentor (RTIH): Full program oversight</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FFD60A">▶</span><span class="req-text">Domain Experts: Agri, Export, Technology, Finance (2 sessions each)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FFD60A">▶</span><span class="req-text">Legal Advisor: 1 session on compliance &amp; IP</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FFD60A">▶</span><span class="req-text">Startup Founder Guest Speakers: 4 (one per phase)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FFD60A">▶</span><span class="req-text">Industry Jury for Demo Day: 5 members (investors, govt, industry)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FFD60A">▶</span><span class="req-text">Pitch Coach: Weeks 5–6</span></div>
+        </div>
+      </div>
+
+      <div class="req-card" style="border-color:rgba(6,255,165,0.2)">
+        <div class="req-header" style="background:rgba(6,255,165,0.06);border-color:rgba(6,255,165,0.2)">
+          <span class="req-icon">📦</span><span class="req-title" style="color:#06FFA5">Participant Deliverables</span>
+        </div>
+        <div class="req-body">
+          <div class="req-item"><span class="req-bullet" style="color:#06FFA5">▶</span><span class="req-text">Week 2: Problem Statement + Validated Customer Persona</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#06FFA5">▶</span><span class="req-text">Week 4: Business Model Canvas + MVP Wireframe</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#06FFA5">▶</span><span class="req-text">Week 6: Prototype (physical / digital) + Pitch Deck (10 slides)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#06FFA5">▶</span><span class="req-text">Week 9: Final Prototype + 1-page Business Plan + Demo Day Pitch</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#06FFA5">▶</span><span class="req-text">Portfolio: reflective journal entries per phase</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#06FFA5">▶</span><span class="req-text">Post-program: 3-month follow-up report on progress</span></div>
+        </div>
+      </div>
+
+      <div class="req-card" style="border-color:rgba(255,107,53,0.2)">
+        <div class="req-header" style="background:rgba(255,107,53,0.1);border-color:rgba(255,107,53,0.2)">
+          <span class="req-icon">🏅</span><span class="req-title" style="color:#FF6B35">Certificates &amp; Benefits</span>
+        </div>
+        <div class="req-body">
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Certificate of Completion from RTIH for all graduates</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Best Startup Award – cash prize + incubation support</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Top 5 teams: Fast-track PMEGP / CGTMSE linkage support</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Top 3 teams: Mentorship continuation for 6 months</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">All teams: RTIH alumni network access</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#FF6B35">▶</span><span class="req-text">Linkage to APEDA, IIFT, ECGC for export-ready ventures</span></div>
+        </div>
+      </div>
+
+      <div class="req-card" style="border-color:rgba(46,196,182,0.2)">
+        <div class="req-header" style="background:rgba(46,196,182,0.1);border-color:rgba(46,196,182,0.2)">
+          <span class="req-icon">🕘</span><span class="req-title" style="color:#2EC4B6">Session Timings</span>
+        </div>
+        <div class="req-body">
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Morning Session: 9:00 AM – 11:00 AM (Content / Expert Talk)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Break: 11:00 AM – 11:15 AM</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Workshop / Team Work: 11:15 AM – 1:00 PM</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Total per day: 4 hours</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">Saturdays: Mentor 1-on-1 office hours (optional, 10 AM – 12 PM)</span></div>
+          <div class="req-item"><span class="req-bullet" style="color:#2EC4B6">▶</span><span class="req-text">No sessions on Sundays &amp; Government Holidays</span></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- TIMELINE -->
+  <div id="tab-timeline" class="panel">
+    <div class="timeline-wrap">
+      <div class="timeline-line"></div>
+
+      <div class="tl-item">
+        <div class="tl-dot" style="background:#FF6B35;border:2px solid #FF6B35;color:#fff">✓</div>
+        <div class="tl-card" style="background:rgba(255,107,53,0.05);border-color:rgba(255,107,53,0.3)">
+          <div class="tl-row"><span class="tl-name">Applications Open</span><span class="tl-date" style="color:#FF6B35;background:rgba(255,107,53,0.1)">Apr 28, 2026</span></div>
+          <div class="tl-done-label">COMPLETED</div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot" style="background:#FF6B35;border:2px solid #FF6B35;color:#fff">✓</div>
+        <div class="tl-card" style="background:rgba(255,107,53,0.05);border-color:rgba(255,107,53,0.3)">
+          <div class="tl-row"><span class="tl-name">Registration Closes</span><span class="tl-date" style="color:#FF6B35;background:rgba(255,107,53,0.1)">May 10, 2026</span></div>
+          <div class="tl-done-label">COMPLETED</div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot" style="background:#FF6B35;border:2px solid #FF6B35;color:#fff">✓</div>
+        <div class="tl-card" style="background:rgba(255,107,53,0.05);border-color:rgba(255,107,53,0.3)">
+          <div class="tl-row"><span class="tl-name">Shortlisting &amp; Interviews</span><span class="tl-date" style="color:#FF6B35;background:rgba(255,107,53,0.1)">May 12–14, 2026</span></div>
+          <div class="tl-done-label">COMPLETED</div>
+        </div>
+      </div>
+
+      <div class="tl-item">
+        <div class="tl-dot" style="background:#1a1a2e;border:2px solid #444"></div>
+        <div class="tl-card" style="background:rgba(255,255,255,0.02);border-color:rgba(255,255,255,0.07)">
+          <div class="tl-row"><span class="tl-name">Results Announced</span><span class="tl-date" style="color:#888;background:rgba(255,255,255,0.05)">May 16, 2026</span></div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot" style="background:#1a1a2e;border:2px solid #444"></div>
+        <div class="tl-card" style="background:rgba(255,255,255,0.02);border-color:rgba(255,255,255,0.07)">
+          <div class="tl-row"><span class="tl-name">Orientation — Day 1 (Physical)</span><span class="tl-date" style="color:#888;background:rgba(255,255,255,0.05)">May 18, 2026</span></div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot" style="background:#1a1a2e;border:2px solid #444"></div>
+        <div class="tl-card" style="background:rgba(255,255,255,0.02);border-color:rgba(255,255,255,0.07)">
+          <div class="tl-row"><span class="tl-name">Phase 1 End — IGNITE</span><span class="tl-date" style="color:#888;background:rgba(255,255,255,0.05)">May 30, 2026</span></div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot" style="background:#1a1a2e;border:2px solid #444"></div>
+        <div class="tl-card" style="background:rgba(255,255,255,0.02);border-color:rgba(255,255,255,0.07)">
+          <div class="tl-row"><span class="tl-name">Phase 2 End — BUILD</span><span class="tl-date" style="color:#888;background:rgba(255,255,255,0.05)">Jun 13, 2026</span></div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot" style="background:#1a1a2e;border:2px solid #444"></div>
+        <div class="tl-card" style="background:rgba(255,255,255,0.02);border-color:rgba(255,255,255,0.07)">
+          <div class="tl-row"><span class="tl-name">Phase 3 End — TEST</span><span class="tl-date" style="color:#888;background:rgba(255,255,255,0.05)">Jun 27, 2026</span></div>
+        </div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-dot" style="background:#1a1a2e;border:2px solid #444"></div>
+        <div class="tl-card" style="background:rgba(255,255,255,0.02);border-color:rgba(255,255,255,0.07)">
+          <div class="tl-row"><span class="tl-name">🏆 Demo Day — Grand Finale</span><span class="tl-date" style="color:#888;background:rgba(255,255,255,0.05)">Jul 9, 2026</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="holiday-note">
+      <div class="holiday-label">HOLIDAYS EXCLUDED</div>
+      <div class="holiday-text">June 17 (Eid ul Adha) — excluded. All Sundays excluded throughout. The schedule respects AP State &amp; Central Government holidays. Any additionally declared holidays will be accommodated with makeup virtual sessions announced 48 hours in advance.</div>
+    </div>
+  </div>
+
+</main>
+
+<footer>
+  <div class="footer-main">RATAN TATA INNOVATION HUB · RAJAHMUNDRY · EAST GODAVARI · ANDHRA PRADESH</div>
+  <div class="footer-sub">futurefoundersprogram@rtih.in &nbsp;·&nbsp; Sessions: 9:00 AM – 1:00 PM Daily</div>
+</footer>
+
+<script>
+  function showTab(id, btn) {
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + id).classList.add('active');
+    btn.classList.add('active');
+  }
+
+  function togglePhase(id, btn) {
+    const body = document.getElementById('body-' + id);
+    const icon = document.getElementById('icon-' + id);
+    const isOpen = body.style.display !== 'none';
+    body.style.display = isOpen ? 'none' : 'block';
+    icon.textContent = isOpen ? '+' : '−';
+    btn.classList.toggle('open', !isOpen);
+  }
+</script>
+
+
+</body></html>
